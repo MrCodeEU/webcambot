@@ -127,9 +127,10 @@ async def get_camera_stream_url():
                 return camera_url
             else:
                 raise Exception(f"Failed to get camera stream. Status: {response.status}")
+
 async def record_video(duration):
     """
-    Record video from the camera stream using frame-based capture.
+    Record video from the camera stream using direct stream copy.
     
     Args:
         duration (int): Recording duration in seconds (1-60)
@@ -140,9 +141,6 @@ async def record_video(duration):
     if not (1 <= duration <= 60):
         raise ValueError("Duration must be between 1 and 60 seconds")
 
-    # Calculate frames based on 30fps
-    total_frames = duration * 30
-    
     stream_url = await get_camera_stream_url()
 
     with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
@@ -150,23 +148,15 @@ async def record_video(duration):
 
     headers = f"Authorization: Bearer {HA_TOKEN}"
 
-    # Updated ffmpeg command with improved stream handling
+    # Simplified ffmpeg command that copies the stream directly
     command = [
         'ffmpeg',
-        '-y',  # Overwrite output files
+        '-y',
         '-headers', headers,
         '-i', stream_url,
-        '-t', str(duration),  # Set duration limit
-        '-r', '30',  # Set input/output frame rate
-        '-c:v', 'libx264',  # Use H.264 codec
-        '-preset', 'ultrafast',  # Faster encoding
-        '-crf', '23',  # Balance quality and size
-        '-movflags', '+faststart',  # Enable fast start for web playback
-        '-f', 'mp4',  # Force MP4 format
-        '-reconnect', '1',  # Enable reconnection
-        '-reconnect_at_eof', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',  # Maximum reconnection delay
+        '-t', str(duration),
+        '-c', 'copy',  # Copy stream directly without re-encoding
+        '-movflags', '+faststart',
         output_path
     ]
 
@@ -177,9 +167,16 @@ async def record_video(duration):
             stderr=asyncio.subprocess.PIPE
         )
         
-        # Wait for the process to complete
-        stdout, stderr = await process.communicate()
-        
+        # Wait for the process with timeout
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=duration + 10  # Allow extra time for processing
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            raise Exception("Recording timed out")
+
         if process.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
             raise Exception(f"Failed to record video: {error_msg}")
@@ -301,10 +298,17 @@ async def record_command(ctx, duration: int):
             await ctx.send("⚠️ Duration must be between 1 and 60 seconds!")
             return
 
-        processing_msg = await ctx.send(f"🎥 Recording {duration} seconds of video...")
+        processing_msg = await ctx.send(f"🎥 Starting {duration}-second recording...")
         
         try:
+            # Update message every 5 seconds for longer recordings
+            if duration > 5:
+                for i in range(0, duration, 5):
+                    await asyncio.sleep(5)
+                    await processing_msg.edit(content=f"🎥 Recording in progress... {i+5}/{duration}s")
+
             video_path = await record_video(duration)
+            await processing_msg.edit(content="📼 Processing video...")
             
             # Check if the video exists and has content
             if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
