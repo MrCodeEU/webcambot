@@ -132,11 +132,10 @@ async def get_camera_stream_url():
             else:
                 raise Exception(f"Failed to get camera stream. Status: {response.status}")
 
-async def capture_frames(duration, fps=2):
-    """Capture multiple frames from camera and combine them into video."""
+async def capture_frames(duration, fps=4):
+    """Capture multiple frames from camera."""
     frames = []
     total_frames = duration * fps
-    
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
         "content-type": "application/json",
@@ -145,113 +144,80 @@ async def capture_frames(duration, fps=2):
     camera_url = f"{HA_URL}/api/camera_proxy/{CAMERA_ENTITY_ID}"
     
     async with aiohttp.ClientSession() as session:
-        for _ in range(total_frames):
-            async with session.get(camera_url, headers=headers) as response:
-                if response.status == 200:
-                    frame_data = await response.read()
-                    frames.append(frame_data)
-            await asyncio.sleep(1/fps)
+        for frame_num in range(total_frames):
+            try:
+                async with session.get(camera_url, headers=headers) as response:
+                    if response.status == 200:
+                        frame_data = await response.read()
+                        frames.append(frame_data)
+                    else:
+                        print(f"Failed to capture frame {frame_num}: {response.status}")
+                await asyncio.sleep(1/fps)
+            except Exception as e:
+                print(f"Error capturing frame {frame_num}: {e}")
+                continue
     
     return frames
 
 async def record_video(duration):
-    """
-    Record video using multiple approaches
-    """
+    """Record video by capturing frames and combining them."""
     output_path = None
+    temp_dir = None
+    frame_list = None
+    
     try:
         if not (1 <= duration <= 60):
             raise ValueError("Duration must be between 1 and 60 seconds")
 
+        # Create temporary files
+        temp_dir = tempfile.mkdtemp()
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
             output_path = temp_file.name
+        frame_list = os.path.join(temp_dir, 'frames.txt')
 
-        # First try: Using FFmpeg with different parameters
-        try:
-            stream_url = await get_camera_stream_url()
-            headers = f"Authorization: Bearer {HA_TOKEN}"
-            
-            command = [
-                'ffmpeg',
-                '-y',
-                '-headers', headers,
-                '-i', stream_url,
-                '-t', str(duration),
-                '-c:v', 'libx264',  # Use H.264 codec instead of stream copy
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-f', 'mp4',
-                '-movflags', '+faststart',
-                output_path
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=duration + 5
-                )
-                
-                if process.returncode == 0 and os.path.getsize(output_path) > 1024:
-                    return output_path
-                
-            except (asyncio.TimeoutError, Exception):
-                if process:
-                    process.kill()
-
-        except Exception as e:
-            print(f"FFmpeg attempt failed: {str(e)}")
-
-        # Second try: Frame capture approach
+        # Capture frames
         frames = await capture_frames(duration)
         if not frames:
-            raise Exception("Failed to capture frames")
+            raise Exception("No frames captured")
 
-        # Use FFmpeg to combine frames into video
-        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
-            frame_list = f.name
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Save frames as images
-                frame_files = []
-                for i, frame_data in enumerate(frames):
-                    frame_path = os.path.join(temp_dir, f'frame_{i:04d}.jpg')
-                    with open(frame_path, 'wb') as frame_file:
-                        frame_file.write(frame_data)
-                    frame_files.append(frame_path)
-                    f.write(f"file '{frame_path}'\n".encode())
+        # Save frames as images and create frame list
+        with open(frame_list, 'w') as f:
+            for i, frame_data in enumerate(frames):
+                frame_path = os.path.join(temp_dir, f'frame_{i:04d}.jpg')
+                with open(frame_path, 'wb') as frame_file:
+                    frame_file.write(frame_data)
+                f.write(f"file '{frame_path}'\nduration 0.25\n")  # 4 FPS
 
-            # Combine frames into video
-            command = [
-                'ffmpeg',
-                '-y',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', frame_list,
-                '-c:v', 'libx264',
-                '-pix_fmt', 'yuv420p',
-                '-movflags', '+faststart',
-                output_path
-            ]
+        # Combine frames into video using FFmpeg
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', frame_list,
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            '-r', '24',  # Output frame rate
+            output_path
+        ]
 
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
 
-            os.unlink(frame_list)
+        if process.returncode != 0:
+            print(f"FFmpeg error: {stderr.decode()}")
+            raise Exception("Failed to create video")
 
-            if process.returncode == 0 and os.path.getsize(output_path) > 1024:
-                return output_path
-            else:
-                raise Exception("Failed to create video from frames")
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+            return output_path
+        else:
+            raise Exception("Output file is too small or missing")
 
     except Exception as e:
         if output_path and os.path.exists(output_path):
@@ -260,6 +226,14 @@ async def record_video(duration):
             except:
                 pass
         raise e
+    finally:
+        # Clean up temporary files
+        if temp_dir and os.path.exists(temp_dir):
+            import shutil
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
 
 @bot.event
 async def on_ready():
@@ -459,7 +433,7 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.errors.CommandNotFound):
         pass  # Ignore command not found errors
     elif isinstance(error, commands.errors.MissingRequiredArgument):
-        if ctx.command.name == 'record':
+        if (ctx.command.name == 'record'):
             await ctx.send('⚠️ Please specify the duration in seconds (1-60). Example: `!record 10`')
         else:
             await ctx.send(f'⚠️ Missing required argument: {str(error)}')
