@@ -135,65 +135,61 @@ async def get_camera_stream_url():
 async def record_video(duration):
     """
     Record video from the camera stream using direct stream copy.
-    
-    Args:
-        duration (int): Recording duration in seconds (1-60)
-        
-    Returns:
-        str: Path to the recorded video file
     """
-    if not (1 <= duration <= 60):
-        raise ValueError("Duration must be between 1 and 60 seconds")
-
-    stream_url = await get_camera_stream_url()
-
-    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
-        output_path = temp_file.name
-
-    headers = f"Authorization: Bearer {HA_TOKEN}"
-
-    # Simplified ffmpeg command that copies the stream directly
-    command = [
-        'ffmpeg',
-        '-y',
-        '-headers', headers,
-        '-i', stream_url,
-        '-t', str(duration),
-        '-c', 'copy',  # Copy stream directly without re-encoding
-        '-movflags', '+faststart',
-        output_path
-    ]
-
+    output_path = None
     try:
+        if not (1 <= duration <= 60):
+            raise ValueError("Duration must be between 1 and 60 seconds")
+
+        stream_url = await get_camera_stream_url()
+
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
+            output_path = temp_file.name
+
+        headers = f"Authorization: Bearer {HA_TOKEN}"
+
+        command = [
+            'ffmpeg',
+            '-y',
+            '-headers', headers,
+            '-i', stream_url,
+            '-t', str(duration),
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            output_path
+        ]
+
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         
-        # Wait for the process with timeout
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=duration + 10  # Allow extra time for processing
+                timeout=duration + 10
             )
         except asyncio.TimeoutError:
-            process.kill()
+            if process:
+                process.kill()
             raise Exception("Recording timed out")
 
         if process.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
             raise Exception(f"Failed to record video: {error_msg}")
 
-        # Verify the output file exists and has content
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             raise Exception("Output file is empty or missing")
 
         return output_path
 
     except Exception as e:
-        if os.path.exists(output_path):
-            os.unlink(output_path)
+        if output_path and os.path.exists(output_path):
+            try:
+                os.unlink(output_path)
+            except:
+                pass
         raise e
 
 @bot.event
@@ -297,6 +293,8 @@ async def webcam(ctx):
 )
 async def record_command(ctx, duration: int):
     """Command to record and send a video clip."""
+    processing_msg = None
+    video_path = None
     try:
         if not (1 <= duration <= 60):
             await ctx.send("⚠️ Duration must be between 1 and 60 seconds!")
@@ -304,48 +302,51 @@ async def record_command(ctx, duration: int):
 
         processing_msg = await ctx.send(f"🎥 Starting {duration}-second recording...")
         
-        try:
-            # Update message every 5 seconds for longer recordings
-            if duration > 5:
-                for i in range(0, duration, 5):
-                    await asyncio.sleep(5)
-                    await processing_msg.edit(content=f"🎥 Recording in progress... {i+5}/{duration}s")
+        if duration > 5:
+            for i in range(0, duration, 5):
+                await asyncio.sleep(5)
+                await processing_msg.edit(content=f"🎥 Recording in progress... {i+5}/{duration}s")
 
-            video_path = await record_video(duration)
-            await processing_msg.edit(content="📼 Processing video...")
+        video_path = await record_video(duration)
+        await processing_msg.edit(content="📼 Processing video...")
+        
+        # Check if the video exists and has content
+        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            await ctx.send("❌ Error: Failed to record video (empty file created)")
+            return
             
-            # Check if the video exists and has content
-            if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
-                await ctx.send("❌ Error: Failed to record video (empty file created)")
-                return
+        # Get file size
+        file_size = os.path.getsize(video_path) / (1024 * 1024)  # Convert to MB
+        
+        # Check if file size is within Discord's limit (8MB for small servers)
+        if file_size > 8:
+            await ctx.send("⚠️ Recording was successful but the file is too large to send (>8MB). Try a shorter duration.")
+            return
             
-            # Get file size
-            file_size = os.path.getsize(video_path) / (1024 * 1024)  # Convert to MB
-            
-            # Check if file size is within Discord's limit (8MB for small servers)
-            if file_size > 8:
-                await ctx.send("⚠️ Recording was successful but the file is too large to send (>8MB). Try a shorter duration.")
-                return
-                
-            with open(video_path, 'rb') as video_file:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                discord_file = discord.File(
-                    video_file,
-                    filename=f'camera_clip_{timestamp}.mp4'
-                )
-                await ctx.send(
-                    content=f"📹 Here's your {duration}-second video clip (Size: {file_size:.1f}MB):",
-                    file=discord_file
-                )
-        finally:
-            if os.path.exists(video_path):
-                os.unlink(video_path)
-            await processing_msg.delete()
-
-    except ValueError as ve:
-        await ctx.send(f"⚠️ Error: {str(ve)}")
+        with open(video_path, 'rb') as video_file:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            discord_file = discord.File(
+                video_file,
+                filename=f'camera_clip_{timestamp}.mp4'
+            )
+            await ctx.send(
+                content=f"📹 Here's your {duration}-second video clip (Size: {file_size:.1f}MB):",
+                file=discord_file
+            )
     except Exception as e:
         await ctx.send(f"❌ Error recording video: {str(e)}")
+        raise e
+    finally:
+        if video_path and os.path.exists(video_path):
+            try:
+                os.unlink(video_path)
+            except:
+                pass
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except:
+                pass
 
 @bot.command(
     name='about',
