@@ -146,19 +146,24 @@ async def record_video(duration):
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
             output_path = temp_file.name
 
+        # Construct FFmpeg command with proper stream handling
         headers = f"Authorization: Bearer {HA_TOKEN}"
-
+        
         command = [
             'ffmpeg',
             '-y',
             '-headers', headers,
             '-i', stream_url,
             '-t', str(duration),
-            '-c', 'copy',
+            '-c:v', 'copy',  # Copy video stream
+            '-c:a', 'copy',  # Copy audio stream if exists
+            '-avoid_negative_ts', 'make_zero',
+            '-fflags', '+genpts',  # Generate presentation timestamps
             '-movflags', '+faststart',
             output_path
         ]
 
+        # Start the FFmpeg process
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -166,9 +171,10 @@ async def record_video(duration):
         )
         
         try:
+            # Add extra time to account for stream initialization
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=duration + 10
+                timeout=duration + 15
             )
         except asyncio.TimeoutError:
             if process:
@@ -179,9 +185,13 @@ async def record_video(duration):
             error_msg = stderr.decode() if stderr else "Unknown error"
             raise Exception(f"Failed to record video: {error_msg}")
 
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise Exception("Output file is empty or missing")
+        # Verify the output file
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:  # Less than 1KB
+            raise Exception("Output file is too small or missing")
 
+        # Wait a moment to ensure file is properly written
+        await asyncio.sleep(1)
+        
         return output_path
 
     except Exception as e:
