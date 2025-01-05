@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - 'bot.py'  # Only trigger on changes to bot.py
+      - 'main.py'
 
 jobs:
   deploy:
@@ -15,23 +15,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
         
-      - name: Install SSH key
-        uses: shimataro/ssh-key-action@v2
-        with:
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
-          
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
+        
       - name: Deploy to server
         env:
           REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
           REMOTE_USER: ${{ secrets.REMOTE_USER }}
+          REMOTE_PASS: ${{ secrets.REMOTE_PASS }}
           REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
         run: |
           # Copy the bot file to the server
-          scp bot.py $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/bot.py
+          export SSHPASS=$REMOTE_PASS
+          sshpass -e scp -o StrictHostKeyChecking=no main.py $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/main.py
           
           # Restart the service
-          ssh $REMOTE_USER@$REMOTE_HOST "sudo systemctl restart discord-bot.service"
+          sshpass -e ssh -o StrictHostKeyChecking=no $REMOTE_USER@$REMOTE_HOST "sudo systemctl restart discord-bot.service"
           
           # Check service status
-          ssh $REMOTE_USER@$REMOTE_HOST "sudo systemctl status discord-bot.service"
+          sshpass -e ssh -o StrictHostKeyChecking=no $REMOTE_USER@$REMOTE_HOST "sudo systemctl status discord-bot.service"
