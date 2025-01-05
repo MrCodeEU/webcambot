@@ -132,67 +132,126 @@ async def get_camera_stream_url():
             else:
                 raise Exception(f"Failed to get camera stream. Status: {response.status}")
 
+async def capture_frames(duration, fps=2):
+    """Capture multiple frames from camera and combine them into video."""
+    frames = []
+    total_frames = duration * fps
+    
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "content-type": "application/json",
+    }
+    
+    camera_url = f"{HA_URL}/api/camera_proxy/{CAMERA_ENTITY_ID}"
+    
+    async with aiohttp.ClientSession() as session:
+        for _ in range(total_frames):
+            async with session.get(camera_url, headers=headers) as response:
+                if response.status == 200:
+                    frame_data = await response.read()
+                    frames.append(frame_data)
+            await asyncio.sleep(1/fps)
+    
+    return frames
+
 async def record_video(duration):
     """
-    Record video from the camera stream using direct stream copy.
+    Record video using multiple approaches
     """
     output_path = None
     try:
         if not (1 <= duration <= 60):
             raise ValueError("Duration must be between 1 and 60 seconds")
 
-        stream_url = await get_camera_stream_url()
-
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
             output_path = temp_file.name
 
-        # Construct FFmpeg command with proper stream handling
-        headers = f"Authorization: Bearer {HA_TOKEN}"
-        
-        command = [
-            'ffmpeg',
-            '-y',
-            '-headers', headers,
-            '-i', stream_url,
-            '-t', str(duration),
-            '-c:v', 'copy',  # Copy video stream
-            '-c:a', 'copy',  # Copy audio stream if exists
-            '-avoid_negative_ts', 'make_zero',
-            '-fflags', '+genpts',  # Generate presentation timestamps
-            '-movflags', '+faststart',
-            output_path
-        ]
-
-        # Start the FFmpeg process
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
+        # First try: Using FFmpeg with different parameters
         try:
-            # Add extra time to account for stream initialization
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=duration + 15
+            stream_url = await get_camera_stream_url()
+            headers = f"Authorization: Bearer {HA_TOKEN}"
+            
+            command = [
+                'ffmpeg',
+                '-y',
+                '-headers', headers,
+                '-i', stream_url,
+                '-t', str(duration),
+                '-c:v', 'libx264',  # Use H.264 codec instead of stream copy
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-f', 'mp4',
+                '-movflags', '+faststart',
+                output_path
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-        except asyncio.TimeoutError:
-            if process:
-                process.kill()
-            raise Exception("Recording timed out")
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=duration + 5
+                )
+                
+                if process.returncode == 0 and os.path.getsize(output_path) > 1024:
+                    return output_path
+                
+            except (asyncio.TimeoutError, Exception):
+                if process:
+                    process.kill()
 
-        if process.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            raise Exception(f"Failed to record video: {error_msg}")
+        except Exception as e:
+            print(f"FFmpeg attempt failed: {str(e)}")
 
-        # Verify the output file
-        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:  # Less than 1KB
-            raise Exception("Output file is too small or missing")
+        # Second try: Frame capture approach
+        frames = await capture_frames(duration)
+        if not frames:
+            raise Exception("Failed to capture frames")
 
-        # Wait a moment to ensure file is properly written
-        await asyncio.sleep(1)
-        
-        return output_path
+        # Use FFmpeg to combine frames into video
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+            frame_list = f.name
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Save frames as images
+                frame_files = []
+                for i, frame_data in enumerate(frames):
+                    frame_path = os.path.join(temp_dir, f'frame_{i:04d}.jpg')
+                    with open(frame_path, 'wb') as frame_file:
+                        frame_file.write(frame_data)
+                    frame_files.append(frame_path)
+                    f.write(f"file '{frame_path}'\n".encode())
+
+            # Combine frames into video
+            command = [
+                'ffmpeg',
+                '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', frame_list,
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                output_path
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+
+            os.unlink(frame_list)
+
+            if process.returncode == 0 and os.path.getsize(output_path) > 1024:
+                return output_path
+            else:
+                raise Exception("Failed to create video from frames")
 
     except Exception as e:
         if output_path and os.path.exists(output_path):
