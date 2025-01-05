@@ -127,14 +127,13 @@ async def get_camera_stream_url():
                 return camera_url
             else:
                 raise Exception(f"Failed to get camera stream. Status: {response.status}")
-
 async def record_video(duration):
     """
     Record video from the camera stream using frame-based capture.
-
+    
     Args:
         duration (int): Recording duration in seconds (1-60)
-
+        
     Returns:
         str: Path to the recorded video file
     """
@@ -143,7 +142,7 @@ async def record_video(duration):
 
     # Calculate frames based on 30fps
     total_frames = duration * 30
-
+    
     stream_url = await get_camera_stream_url()
 
     with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
@@ -151,38 +150,43 @@ async def record_video(duration):
 
     headers = f"Authorization: Bearer {HA_TOKEN}"
 
-    # Updated ffmpeg command with frame limit
+    # Updated ffmpeg command with improved stream handling
     command = [
         'ffmpeg',
         '-y',  # Overwrite output files
         '-headers', headers,
         '-i', stream_url,
-        '-vframes', str(total_frames),  # Limit by number of frames
+        '-t', str(duration),  # Set duration limit
         '-r', '30',  # Set input/output frame rate
         '-c:v', 'libx264',  # Use H.264 codec
         '-preset', 'ultrafast',  # Faster encoding
         '-crf', '23',  # Balance quality and size
         '-movflags', '+faststart',  # Enable fast start for web playback
         '-f', 'mp4',  # Force MP4 format
+        '-reconnect', '1',  # Enable reconnection
+        '-reconnect_at_eof', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',  # Maximum reconnection delay
         output_path
     ]
 
     try:
-        # Create progress message format
-        progress_re = re.compile(r'frame=\s*(\d+)')
-
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-
+        
         # Wait for the process to complete
         stdout, stderr = await process.communicate()
-
+        
         if process.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
             raise Exception(f"Failed to record video: {error_msg}")
+
+        # Verify the output file exists and has content
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise Exception("Output file is empty or missing")
 
         return output_path
 
@@ -278,11 +282,13 @@ async def webcam(ctx):
             except:
                 pass
 
+        raise e
+
 @bot.command(
     name='record',
     help='Record a video clip from the camera',
     brief='Record video clip',
-    enabled=True,  # Enable the command
+    enabled=True,
     examples=[
         "!record 5  # Record 5 seconds",
         "!record 30  # Record 30 seconds"
@@ -296,18 +302,23 @@ async def record_command(ctx, duration: int):
             return
 
         processing_msg = await ctx.send(f"🎥 Recording {duration} seconds of video...")
-
+        
         try:
             video_path = await record_video(duration)
-
+            
+            # Check if the video exists and has content
+            if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+                await ctx.send("❌ Error: Failed to record video (empty file created)")
+                return
+            
             # Get file size
             file_size = os.path.getsize(video_path) / (1024 * 1024)  # Convert to MB
-
+            
             # Check if file size is within Discord's limit (8MB for small servers)
             if file_size > 8:
                 await ctx.send("⚠️ Recording was successful but the file is too large to send (>8MB). Try a shorter duration.")
                 return
-
+                
             with open(video_path, 'rb') as video_file:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 discord_file = discord.File(
@@ -315,7 +326,7 @@ async def record_command(ctx, duration: int):
                     filename=f'camera_clip_{timestamp}.mp4'
                 )
                 await ctx.send(
-                    content=f"📹 Here's your {duration}-second video clip:",
+                    content=f"📹 Here's your {duration}-second video clip (Size: {file_size:.1f}MB):",
                     file=discord_file
                 )
         finally:
