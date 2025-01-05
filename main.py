@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 import subprocess
 import re
 
+# Bot Version Info
+BOT_VERSION = "1.0.0"
+BOT_LAST_UPDATED = "Not deployed yet"  # This will be replaced during deployment
+
 # Load environment variables
 load_dotenv()
 
@@ -357,6 +361,12 @@ async def about(ctx):
     )
 
     # Add bot information
+    embed.add_field(
+        name="Version Info",
+        value=f"Version: `{BOT_VERSION}`\nLast Updated: `{BOT_LAST_UPDATED}`",
+        inline=False
+    )
+
     embed.add_field(
         name="Commands",
         value="Type `!help` to see all available commands",

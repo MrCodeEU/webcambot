@@ -18,6 +18,13 @@ jobs:
       - name: Install sshpass
         run: sudo apt-get install -y sshpass
         
+      - name: Update deployment timestamp
+        run: |
+          # Get current UTC time
+          TIMESTAMP=$(date -u "+%Y-%m-%d %H:%M UTC")
+          # Replace the placeholder in main.py
+          sed -i "s/BOT_LAST_UPDATED = \".*\"/BOT_LAST_UPDATED = \"$TIMESTAMP\"/" main.py
+        
       - name: Deploy to server
         env:
           REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
